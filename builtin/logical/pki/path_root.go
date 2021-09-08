@@ -19,7 +19,6 @@ import (
 
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 
-	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/errutil"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -106,7 +105,7 @@ func pathSignSelfIssued(b *backend) *framework.Path {
 		},
 
 		Fields: map[string]*framework.FieldSchema{
-			"certificate": &framework.FieldSchema{
+			"certificate": {
 				Type:        framework.TypeString,
 				Description: `PEM-format self-issued certificate to be signed.`,
 			},
@@ -168,7 +167,7 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 
 	cb, err := parsedBundle.ToCertBundle()
 	if err != nil {
-		return nil, errwrap.Wrapf("error converting raw cert bundle to cert bundle: {{err}}", err)
+		return nil, fmt.Errorf("error converting raw cert bundle to cert bundle: %w", err)
 	}
 
 	resp := &logical.Response{
@@ -231,7 +230,7 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 		Value: parsedBundle.CertificateBytes,
 	})
 	if err != nil {
-		return nil, errwrap.Wrapf("unable to store certificate locally: {{err}}", err)
+		return nil, fmt.Errorf("unable to store certificate locally: %w", err)
 	}
 
 	// For ease of later use, also store just the certificate at a known
@@ -324,17 +323,17 @@ func (b *backend) pathCASignIntermediate(ctx context.Context, req *logical.Reque
 	}
 
 	if err := parsedBundle.Verify(); err != nil {
-		return nil, errwrap.Wrapf("verification of parsed bundle failed: {{err}}", err)
+		return nil, fmt.Errorf("verification of parsed bundle failed: %w", err)
 	}
 
 	signingCB, err := signingBundle.ToCertBundle()
 	if err != nil {
-		return nil, errwrap.Wrapf("error converting raw signing bundle to cert bundle: {{err}}", err)
+		return nil, fmt.Errorf("error converting raw signing bundle to cert bundle: %w", err)
 	}
 
 	cb, err := parsedBundle.ToCertBundle()
 	if err != nil {
-		return nil, errwrap.Wrapf("error converting raw cert bundle to cert bundle: {{err}}", err)
+		return nil, fmt.Errorf("error converting raw cert bundle to cert bundle: %w", err)
 	}
 
 	resp := &logical.Response{
@@ -381,7 +380,7 @@ func (b *backend) pathCASignIntermediate(ctx context.Context, req *logical.Reque
 		Value: parsedBundle.CertificateBytes,
 	})
 	if err != nil {
-		return nil, errwrap.Wrapf("unable to store certificate locally: {{err}}", err)
+		return nil, fmt.Errorf("unable to store certificate locally: %w", err)
 	}
 
 	if parsedBundle.Certificate.MaxPathLen == 0 {
@@ -428,7 +427,7 @@ func (b *backend) pathCASignSelfIssued(ctx context.Context, req *logical.Request
 
 	signingCB, err := signingBundle.ToCertBundle()
 	if err != nil {
-		return nil, errwrap.Wrapf("error converting raw signing bundle to cert bundle: {{err}}", err)
+		return nil, fmt.Errorf("error converting raw signing bundle to cert bundle: %w", err)
 	}
 
 	urls := &certutil.URLEntries{}
@@ -460,7 +459,7 @@ func (b *backend) pathCASignSelfIssued(ctx context.Context, req *logical.Request
 
 	newCert, err := x509.CreateCertificate(rand.Reader, cert, signingBundle.Certificate, cert.PublicKey, signingBundle.PrivateKey)
 	if err != nil {
-		return nil, errwrap.Wrapf("error signing self-issued certificate: {{err}}", err)
+		return nil, fmt.Errorf("error signing self-issued certificate: %w", err)
 	}
 	if len(newCert) == 0 {
 		return nil, fmt.Errorf("nil cert was created when signing self-issued certificate")

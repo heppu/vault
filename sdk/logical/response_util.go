@@ -81,7 +81,7 @@ func RespondErrorCommon(req *Request, resp *Response, err error) (int, error) {
 			}
 		})
 		if allErrors != nil {
-			return codedErr.Code, multierror.Append(errors.New(fmt.Sprintf("errors from both primary and secondary; primary error was %v; secondary errors follow", codedErr.Msg)), allErrors)
+			return codedErr.Code, multierror.Append(fmt.Errorf("errors from both primary and secondary; primary error was %v; secondary errors follow", codedErr.Msg), allErrors)
 		}
 		return codedErr.Code, errors.New(codedErr.Msg)
 	}
@@ -102,6 +102,8 @@ func RespondErrorCommon(req *Request, resp *Response, err error) (int, error) {
 			statusCode = http.StatusBadRequest
 		case errwrap.Contains(err, ErrPermissionDenied.Error()):
 			statusCode = http.StatusForbidden
+		case errwrap.Contains(err, consts.ErrInvalidWrappingToken.Error()):
+			statusCode = http.StatusBadRequest
 		case errwrap.Contains(err, ErrUnsupportedOperation.Error()):
 			statusCode = http.StatusMethodNotAllowed
 		case errwrap.Contains(err, ErrUnsupportedPath.Error()):
@@ -110,6 +112,14 @@ func RespondErrorCommon(req *Request, resp *Response, err error) (int, error) {
 			statusCode = http.StatusBadRequest
 		case errwrap.Contains(err, ErrUpstreamRateLimited.Error()):
 			statusCode = http.StatusBadGateway
+		case errwrap.Contains(err, ErrRateLimitQuotaExceeded.Error()):
+			statusCode = http.StatusTooManyRequests
+		case errwrap.Contains(err, ErrLeaseCountQuotaExceeded.Error()):
+			statusCode = http.StatusTooManyRequests
+		case errwrap.Contains(err, ErrMissingRequiredState.Error()):
+			statusCode = http.StatusPreconditionFailed
+		case errwrap.Contains(err, ErrPathFunctionalityRemoved.Error()):
+			statusCode = http.StatusNotFound
 		}
 	}
 

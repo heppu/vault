@@ -21,8 +21,9 @@ var (
 	// changed
 	DefaultWrappingTTL = "5m"
 
-	// The default function used if no other function is set, which honors the
-	// env var and wraps `sys/wrapping/wrap`
+	// The default function used if no other function is set. It honors the env
+	// var to set the wrap TTL. The default wrap TTL will apply when when writing
+	// to `sys/wrapping/wrap` when the env var is not set.
 	DefaultWrappingLookupFunc = func(operation, path string) string {
 		if os.Getenv(EnvVaultWrapTTL) != "" {
 			return os.Getenv(EnvVaultWrapTTL)
@@ -80,7 +81,7 @@ func (c *Logical) ReadWithData(path string, data map[string][]string) (*Secret, 
 		case io.EOF:
 			return nil, nil
 		default:
-			return nil, err
+			return nil, parseErr
 		}
 		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 			return secret, nil
@@ -114,7 +115,7 @@ func (c *Logical) List(path string) (*Secret, error) {
 		case io.EOF:
 			return nil, nil
 		default:
-			return nil, err
+			return nil, parseErr
 		}
 		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 			return secret, nil
@@ -158,7 +159,7 @@ func (c *Logical) write(path string, request *Request) (*Secret, error) {
 		case io.EOF:
 			return nil, nil
 		default:
-			return nil, err
+			return nil, parseErr
 		}
 		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 			return secret, err
@@ -205,7 +206,7 @@ func (c *Logical) DeleteWithData(path string, data map[string][]string) (*Secret
 		case io.EOF:
 			return nil, nil
 		default:
-			return nil, err
+			return nil, parseErr
 		}
 		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 			return secret, err
@@ -258,7 +259,7 @@ func (c *Logical) Unwrap(wrappingToken string) (*Secret, error) {
 	case io.EOF:
 		return nil, nil
 	default:
-		return nil, err
+		return nil, parseErr
 	}
 	if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 		return secret, nil

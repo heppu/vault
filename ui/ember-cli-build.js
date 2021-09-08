@@ -45,7 +45,6 @@ module.exports = function(defaults) {
     sassOptions: {
       sourceMap: false,
       onlyIncluded: true,
-      implementation: require('node-sass'),
     },
     autoprefixer: {
       enabled: isTest || isProd,
@@ -57,10 +56,6 @@ module.exports = function(defaults) {
     },
     'ember-test-selectors': {
       strip: isProd,
-    },
-    // https://github.com/ember-cli/ember-fetch/issues/204
-    'ember-fetch': {
-      preferNative: true,
     },
     'ember-composable-helpers': {
       except: ['array'],

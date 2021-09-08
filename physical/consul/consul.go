@@ -4,20 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	log "github.com/hashicorp/go-hclog"
-
-	metrics "github.com/armon/go-metrics"
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/errwrap"
-	multierror "github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/vault/sdk/helper/parseutil"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
+	"github.com/hashicorp/go-secure-stdlib/tlsutil"
+	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/physical"
-	sr "github.com/hashicorp/vault/serviceregistration"
-	csr "github.com/hashicorp/vault/serviceregistration/consul"
+	"github.com/hashicorp/vault/vault/diagnose"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -31,18 +32,18 @@ const (
 )
 
 // Verify ConsulBackend satisfies the correct interfaces
-var _ physical.Backend = (*ConsulBackend)(nil)
-var _ physical.HABackend = (*ConsulBackend)(nil)
-var _ physical.Lock = (*ConsulLock)(nil)
-var _ physical.Transactional = (*ConsulBackend)(nil)
-var _ sr.ServiceRegistration = (*ConsulBackend)(nil)
+var (
+	_ physical.Backend       = (*ConsulBackend)(nil)
+	_ physical.HABackend     = (*ConsulBackend)(nil)
+	_ physical.Lock          = (*ConsulLock)(nil)
+	_ physical.Transactional = (*ConsulBackend)(nil)
+)
 
 // ConsulBackend is a physical backend that stores data at specific
 // prefix within Consul. It is used for most production situations as
 // it allows Vault to run on multiple machines in a highly-available manner.
 type ConsulBackend struct {
-	*csr.ConsulServiceRegistration
-
+	client          *api.Client
 	path            string
 	kv              *api.KV
 	permitPool      *physical.PermitPool
@@ -55,15 +56,6 @@ type ConsulBackend struct {
 // NewConsulBackend constructs a Consul backend using the given API client
 // and the prefix in the KV store.
 func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backend, error) {
-
-	// Create the ConsulServiceRegistration struct that we will embed in the
-	// ConsulBackend
-	sreg, err := csr.NewConsulServiceRegistration(conf, logger)
-	if err != nil {
-		return nil, err
-	}
-	csreg := sreg.(*csr.ConsulServiceRegistration)
-
 	// Get the path in Consul
 	path, ok := conf["path"]
 	if !ok {
@@ -88,7 +80,7 @@ func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backe
 	if ok {
 		_, err := parseutil.ParseDurationSecond(sessionTTLStr)
 		if err != nil {
-			return nil, errwrap.Wrapf("invalid session_ttl: {{err}}", err)
+			return nil, fmt.Errorf("invalid session_ttl: %w", err)
 		}
 		sessionTTL = sessionTTLStr
 		if logger.IsDebug() {
@@ -101,7 +93,7 @@ func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backe
 	if ok {
 		d, err := parseutil.ParseDurationSecond(lockWaitTimeRaw)
 		if err != nil {
-			return nil, errwrap.Wrapf("invalid lock_wait_time: {{err}}", err)
+			return nil, fmt.Errorf("invalid lock_wait_time: %w", err)
 		}
 		lockWaitTime = d
 		if logger.IsDebug() {
@@ -112,9 +104,9 @@ func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backe
 	maxParStr, ok := conf["max_parallel"]
 	var maxParInt int
 	if ok {
-		maxParInt, err = strconv.Atoi(maxParStr)
+		maxParInt, err := strconv.Atoi(maxParStr)
 		if err != nil {
-			return nil, errwrap.Wrapf("failed parsing max_parallel parameter: {{err}}", err)
+			return nil, fmt.Errorf("failed parsing max_parallel parameter: %w", err)
 		}
 		if logger.IsDebug() {
 			logger.Debug("max_parallel set", "max_parallel", maxParInt)
@@ -132,12 +124,24 @@ func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backe
 		consistencyMode = consistencyModeDefault
 	}
 
+	// Configure the client
+	consulConf := api.DefaultConfig()
+	// Set MaxIdleConnsPerHost to the number of processes used in expiration.Restore
+	consulConf.Transport.MaxIdleConnsPerHost = consts.ExpirationRestoreWorkerCount
+
+	SetupSecureTLS(context.Background(), consulConf, conf, logger, false)
+
+	consulConf.HttpClient = &http.Client{Transport: consulConf.Transport}
+	client, err := api.NewClient(consulConf)
+	if err != nil {
+		return nil, fmt.Errorf("client setup failed: %w", err)
+	}
+
 	// Setup the backend
 	c := &ConsulBackend{
-		ConsulServiceRegistration: csreg,
-
 		path:            path,
-		kv:              csreg.Client.KV(),
+		client:          client,
+		kv:              client.KV(),
 		permitPool:      physical.NewPermitPool(maxParInt),
 		consistencyMode: consistencyMode,
 
@@ -147,11 +151,81 @@ func NewConsulBackend(conf map[string]string, logger log.Logger) (physical.Backe
 	return c, nil
 }
 
+func SetupSecureTLS(ctx context.Context, consulConf *api.Config, conf map[string]string, logger log.Logger, isDiagnose bool) error {
+	if addr, ok := conf["address"]; ok {
+		consulConf.Address = addr
+		if logger.IsDebug() {
+			logger.Debug("config address set", "address", addr)
+		}
+
+		// Copied from the Consul API module; set the Scheme based on
+		// the protocol field if address looks ike a URL.
+		// This can enable the TLS configuration below.
+		parts := strings.SplitN(addr, "://", 2)
+		if len(parts) == 2 {
+			if parts[0] == "http" || parts[0] == "https" {
+				consulConf.Scheme = parts[0]
+				consulConf.Address = parts[1]
+				if logger.IsDebug() {
+					logger.Debug("config address parsed", "scheme", parts[0])
+					logger.Debug("config scheme parsed", "address", parts[1])
+				}
+			} // allow "unix:" or whatever else consul supports in the future
+		}
+	}
+	if scheme, ok := conf["scheme"]; ok {
+		consulConf.Scheme = scheme
+		if logger.IsDebug() {
+			logger.Debug("config scheme set", "scheme", scheme)
+		}
+	}
+	if token, ok := conf["token"]; ok {
+		consulConf.Token = token
+		logger.Debug("config token set")
+	}
+
+	if consulConf.Scheme == "https" {
+		if isDiagnose {
+			certPath, okCert := conf["tls_cert_file"]
+			keyPath, okKey := conf["tls_key_file"]
+			if okCert && okKey {
+				warnings, err := diagnose.TLSFileChecks(certPath, keyPath)
+				for _, warning := range warnings {
+					diagnose.Warn(ctx, warning)
+				}
+				if err != nil {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("key or cert path: %s, %s, cannot be loaded from consul config file", certPath, keyPath)
+		}
+
+		// Use the parsed Address instead of the raw conf['address']
+		tlsClientConfig, err := tlsutil.SetupTLSConfig(conf, consulConf.Address)
+		if err != nil {
+			return err
+		}
+
+		consulConf.Transport.TLSClientConfig = tlsClientConfig
+		if err := http2.ConfigureTransport(consulConf.Transport); err != nil {
+			return err
+		}
+		logger.Debug("configured TLS")
+	} else {
+		if isDiagnose {
+			diagnose.Skipped(ctx, "HTTPS is not used, Skipping TLS verification.")
+		}
+	}
+	return nil
+}
+
 // Used to run multiple entries via a transaction
 func (c *ConsulBackend) Transaction(ctx context.Context, txns []*physical.TxnEntry) error {
 	if len(txns) == 0 {
 		return nil
 	}
+	defer metrics.MeasureSince([]string{"consul", "transaction"}, time.Now())
 
 	ops := make([]*api.KVTxnOp, 0, len(txns))
 
@@ -181,7 +255,7 @@ func (c *ConsulBackend) Transaction(ctx context.Context, txns []*physical.TxnEnt
 	ok, resp, _, err := c.kv.Txn(ops, queryOpts)
 	if err != nil {
 		if strings.Contains(err.Error(), "is too large") {
-			return errwrap.Wrapf(fmt.Sprintf("%s: {{err}}", physical.ErrValueTooLarge), err)
+			return fmt.Errorf("%s: %w", physical.ErrValueTooLarge, err)
 		}
 		return err
 	}
@@ -215,7 +289,7 @@ func (c *ConsulBackend) Put(ctx context.Context, entry *physical.Entry) error {
 	_, err := c.kv.Put(pair, writeOpts)
 	if err != nil {
 		if strings.Contains(err.Error(), "Value exceeds") {
-			return errwrap.Wrapf(fmt.Sprintf("%s: {{err}}", physical.ErrValueTooLarge), err)
+			return fmt.Errorf("%s: %w", physical.ErrValueTooLarge, err)
 		}
 		return err
 	}
@@ -302,12 +376,12 @@ func (c *ConsulBackend) LockWith(key, value string) (physical.Lock, error) {
 		SessionTTL:     c.sessionTTL,
 		LockWaitTime:   c.lockWaitTime,
 	}
-	lock, err := c.Client.LockOpts(opts)
+	lock, err := c.client.LockOpts(opts)
 	if err != nil {
-		return nil, errwrap.Wrapf("failed to create lock: {{err}}", err)
+		return nil, fmt.Errorf("failed to create lock: %w", err)
 	}
 	cl := &ConsulLock{
-		client:          c.Client,
+		client:          c.client,
 		key:             c.path + key,
 		lock:            lock,
 		consistencyMode: c.consistencyMode,
@@ -323,7 +397,7 @@ func (c *ConsulBackend) HAEnabled() bool {
 
 // DetectHostAddr is used to detect the host address by asking the Consul agent
 func (c *ConsulBackend) DetectHostAddr() (string, error) {
-	agent := c.Client.Agent()
+	agent := c.client.Agent()
 	self, err := agent.Self()
 	if err != nil {
 		return "", err

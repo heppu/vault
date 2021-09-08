@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/vault/sdk/helper/strutil"
+	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/mitchellh/mapstructure"
 )
@@ -584,6 +584,12 @@ func TestPki_RoleNoStore(t *testing.T) {
 	noStore := resp.Data["no_store"].(bool)
 	if noStore {
 		t.Fatalf("no_store should not be set by default")
+	}
+
+	// By default, allowed_domains_template should be `false`
+	allowedDomainsTemplate := resp.Data["allowed_domains_template"].(bool)
+	if allowedDomainsTemplate {
+		t.Fatalf("allowed_domains_template should not be set by default")
 	}
 
 	// Make sure that setting no_store to `true` works properly

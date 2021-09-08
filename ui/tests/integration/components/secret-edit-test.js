@@ -35,7 +35,7 @@ module('Integration | Component | secret edit', function(hooks) {
     });
 
     await render(hbs`{{secret-edit mode=mode model=model }}`);
-    assert.dom('[data-test-secret-json-toggle]').isDisabled();
+    assert.dom('[data-test-toggle-input="json"]').isDisabled();
   });
 
   test('it does JSON toggle in show mode when showing string data', async function(assert) {
@@ -49,7 +49,7 @@ module('Integration | Component | secret edit', function(hooks) {
     });
 
     await render(hbs`{{secret-edit mode=mode model=model }}`);
-    assert.dom('[data-test-secret-json-toggle]').isNotDisabled();
+    assert.dom('[data-test-toggle-input="json"]').isNotDisabled();
   });
 
   test('it shows an error when creating and data is not an object', async function(assert) {
@@ -94,9 +94,11 @@ module('Integration | Component | secret edit', function(hooks) {
         null: 'null',
         float: '1.234',
       },
+      canReadSecretData: true,
     });
 
     await render(hbs`{{secret-edit mode=mode model=model preferAdvancedEdit=true }}`);
+    await settled();
     let instance = this.codeMirror.instanceFor(find('[data-test-component=json-editor]').id);
     instance.setValue(JSON.stringify([{ foo: 'bar' }]));
     await settled();

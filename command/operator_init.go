@@ -14,8 +14,10 @@ import (
 	consulapi "github.com/hashicorp/consul/api"
 )
 
-var _ cli.Command = (*OperatorInitCommand)(nil)
-var _ cli.CommandAutocomplete = (*OperatorInitCommand)(nil)
+var (
+	_ cli.Command             = (*OperatorInitCommand)(nil)
+	_ cli.CommandAutocomplete = (*OperatorInitCommand)(nil)
+)
 
 type OperatorInitCommand struct {
 	*BaseCommand
@@ -94,7 +96,7 @@ func (c *OperatorInitCommand) Flags() *FlagSets {
 		Default: false,
 		Usage: "Print the current initialization status. An exit code of 0 means " +
 			"the Vault is already initialized. An exit code of 1 means an error " +
-			"occurred. An exit code of 2 means the mean is not initialized.",
+			"occurred. An exit code of 2 means the Vault is not initialized.",
 	})
 
 	f.IntVar(&IntVar{
@@ -446,7 +448,7 @@ func (c *OperatorInitCommand) init(client *api.Client, req *api.InitRequest) int
 		c.UI.Output("")
 		c.UI.Output(wrapAtLength(fmt.Sprintf(
 			"Vault does not store the generated master key. Without at least %d "+
-				"key to reconstruct the master key, Vault will remain permanently "+
+				"keys to reconstruct the master key, Vault will remain permanently "+
 				"sealed!",
 			req.SecretThreshold)))
 
@@ -489,13 +491,25 @@ func (c *OperatorInitCommand) status(client *api.Client) int {
 		return 1 // Normally we'd return 2, but 2 means something special here
 	}
 
-	if inited {
-		c.UI.Output("Vault is initialized")
-		return 0
+	errorCode := 0
+
+	if !inited {
+		errorCode = 2
 	}
 
-	c.UI.Output("Vault is not initialized")
-	return 2
+	switch Format(c.UI) {
+	case "table":
+		if inited {
+			c.UI.Output("Vault is initialized")
+		} else {
+			c.UI.Output("Vault is not initialized")
+		}
+	default:
+		data := api.InitStatusResponse{Initialized: inited}
+		OutputData(c.UI, data)
+	}
+
+	return errorCode
 }
 
 // machineInit is used to output information about the init command.

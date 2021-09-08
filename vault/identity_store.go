@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	metrics "github.com/armon/go-metrics"
 	"github.com/golang/protobuf/ptypes"
-	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/storagepacker"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
-	"github.com/hashicorp/vault/sdk/helper/strutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -24,7 +26,6 @@ const (
 
 var (
 	caseSensitivityKey           = "casesensitivity"
-	sendGroupUpgrade             = func(*IdentityStore, *identity.Group) (bool, error) { return false, nil }
 	parseExtraEntityFromBucket   = func(context.Context, *IdentityStore, *identity.Entity) (bool, error) { return false, nil }
 	addExtraEntityDataToResponse = func(*identity.Entity, map[string]interface{}) {}
 )
@@ -46,9 +47,15 @@ func (i *IdentityStore) resetDB(ctx context.Context) error {
 
 func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendConfig, logger log.Logger) (*IdentityStore, error) {
 	iStore := &IdentityStore{
-		view:   config.StorageView,
-		logger: logger,
-		core:   core,
+		view:          config.StorageView,
+		logger:        logger,
+		router:        core.router,
+		redirectAddr:  core.redirectAddr,
+		localNode:     core,
+		namespacer:    core,
+		metrics:       core.MetricSink(),
+		totpPersister: core,
+		groupUpdater:  core,
 	}
 
 	// Create a memdb instance, which by default, operates on lower cased
@@ -64,12 +71,12 @@ func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendCo
 	core.AddLogger(groupsPackerLogger)
 	iStore.entityPacker, err = storagepacker.NewStoragePacker(iStore.view, entitiesPackerLogger, "")
 	if err != nil {
-		return nil, errwrap.Wrapf("failed to create entity packer: {{err}}", err)
+		return nil, fmt.Errorf("failed to create entity packer: %w", err)
 	}
 
 	iStore.groupPacker, err = storagepacker.NewStoragePacker(iStore.view, groupsPackerLogger, groupBucketsPrefix)
 	if err != nil {
-		return nil, errwrap.Wrapf("failed to create group packer: {{err}}", err)
+		return nil, fmt.Errorf("failed to create group packer: %w", err)
 	}
 
 	iStore.Backend = &framework.Backend{
@@ -108,6 +115,7 @@ func (i *IdentityStore) paths() []*framework.Path {
 		lookupPaths(i),
 		upgradePaths(i),
 		oidcPaths(i),
+		oidcProviderPaths(i),
 	)
 }
 
@@ -207,7 +215,7 @@ func (i *IdentityStore) Invalidate(ctx context.Context, key string) {
 		}
 
 		// Get the storage bucket entry
-		bucket, err := i.entityPacker.GetBucket(key)
+		bucket, err := i.entityPacker.GetBucket(ctx, key)
 		if err != nil {
 			i.logger.Error("failed to refresh entities", "key", key, "error", err)
 			return
@@ -270,7 +278,7 @@ func (i *IdentityStore) Invalidate(ctx context.Context, key string) {
 		}
 
 		// Get the storage bucket entry
-		bucket, err := i.groupPacker.GetBucket(key)
+		bucket, err := i.groupPacker.GetBucket(ctx, key)
 		if err != nil {
 			i.logger.Error("failed to refresh group", "key", key, "error", err)
 			return
@@ -315,7 +323,15 @@ func (i *IdentityStore) Invalidate(ctx context.Context, key string) {
 		return
 
 	case strings.HasPrefix(key, oidcTokensPrefix):
-		if err := i.oidcCache.Flush(noNamespace); err != nil {
+		ns, err := namespace.FromContext(ctx)
+		if err != nil {
+			i.logger.Error("error retrieving namespace", "error", err)
+			return
+		}
+
+		// Wipe the cache for the requested namespace. This will also clear
+		// the shared namespace as well.
+		if err := i.oidcCache.Flush(ns); err != nil {
 			i.logger.Error("error flushing oidc cache", "error", err)
 		}
 	}
@@ -337,7 +353,7 @@ func (i *IdentityStore) parseEntityFromBucketItem(ctx context.Context, item *sto
 		var oldEntity identity.EntityStorageEntry
 		oldEntityErr := ptypes.UnmarshalAny(item.Message, &oldEntity)
 		if oldEntityErr != nil {
-			return nil, errwrap.Wrapf("failed to decode entity from storage bucket item: {{err}}", err)
+			return nil, fmt.Errorf("failed to decode entity from storage bucket item: %w", err)
 		}
 
 		i.logger.Debug("upgrading the entity using patch introduced with vault 0.8.2.1", "entity_id", oldEntity.ID)
@@ -381,7 +397,7 @@ func (i *IdentityStore) parseEntityFromBucketItem(ctx context.Context, item *sto
 		persistNeeded = true
 	}
 
-	if persistNeeded && !i.core.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) {
+	if persistNeeded && !i.localNode.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) {
 		entityAsAny, err := ptypes.MarshalAny(&entity)
 		if err != nil {
 			return nil, err
@@ -414,7 +430,7 @@ func (i *IdentityStore) parseGroupFromBucketItem(item *storagepacker.Item) (*ide
 	var group identity.Group
 	err := ptypes.UnmarshalAny(item.Message, &group)
 	if err != nil {
-		return nil, errwrap.Wrapf("failed to decode group from storage bucket item: {{err}}", err)
+		return nil, fmt.Errorf("failed to decode group from storage bucket item: %w", err)
 	}
 
 	if group.NamespaceID == "" {
@@ -440,7 +456,7 @@ func (i *IdentityStore) entityByAliasFactors(mountAccessor, aliasName string, cl
 	return i.entityByAliasFactorsInTxn(txn, mountAccessor, aliasName, clone)
 }
 
-// entityByAlaisFactorsInTxn fetches the entity based on factors of alias, i.e
+// entityByAliasFactorsInTxn fetches the entity based on factors of alias, i.e
 // mount accessor and the alias name.
 func (i *IdentityStore) entityByAliasFactorsInTxn(txn *memdb.Txn, mountAccessor, aliasName string, clone bool) (*identity.Entity, error) {
 	if txn == nil {
@@ -470,6 +486,8 @@ func (i *IdentityStore) entityByAliasFactorsInTxn(txn *memdb.Txn, mountAccessor,
 // CreateOrFetchEntity creates a new entity. This is used by core to
 // associate each login attempt by an alias to a unified entity in Vault.
 func (i *IdentityStore) CreateOrFetchEntity(ctx context.Context, alias *logical.Alias) (*identity.Entity, error) {
+	defer metrics.MeasureSince([]string{"identity", "create_or_fetch_entity"}, time.Now())
+
 	var entity *identity.Entity
 	var err error
 	var update bool
@@ -482,7 +500,7 @@ func (i *IdentityStore) CreateOrFetchEntity(ctx context.Context, alias *logical.
 		return nil, fmt.Errorf("empty alias name")
 	}
 
-	mountValidationResp := i.core.router.validateMountByAccessor(alias.MountAccessor)
+	mountValidationResp := i.router.ValidateMountByAccessor(alias.MountAccessor)
 	if mountValidationResp == nil {
 		return nil, fmt.Errorf("invalid mount accessor %q", alias.MountAccessor)
 	}
@@ -556,6 +574,23 @@ func (i *IdentityStore) CreateOrFetchEntity(ctx context.Context, alias *logical.
 		entity.Aliases = []*identity.Alias{
 			newAlias,
 		}
+
+		// Emit a metric for the new entity
+		ns, err := i.namespacer.NamespaceByID(ctx, entity.NamespaceID)
+		var nsLabel metrics.Label
+		if err != nil {
+			nsLabel = metrics.Label{"namespace", "unknown"}
+		} else {
+			nsLabel = metricsutil.NamespaceLabel(ns)
+		}
+		i.metrics.IncrCounterWithLabels(
+			[]string{"identity", "entity", "creation"},
+			1,
+			[]metrics.Label{
+				nsLabel,
+				{"auth_method", newAlias.MountType},
+				{"mount_point", newAlias.MountPath},
+			})
 	}
 
 	// Update MemDB and persist entity object

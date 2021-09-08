@@ -14,12 +14,12 @@ func pathLogin(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: `login/(?P<username>.+)`,
 		Fields: map[string]*framework.FieldSchema{
-			"username": &framework.FieldSchema{
+			"username": {
 				Type:        framework.TypeString,
 				Description: "DN (distinguished name) to be used for login.",
 			},
 
-			"password": &framework.FieldSchema{
+			"password": {
 				Type:        framework.TypeString,
 				Description: "Password for this user.",
 			},
@@ -133,9 +133,10 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, d *f
 	password := req.Auth.InternalData["password"].(string)
 
 	loginPolicies, resp, groupNames, err := b.Login(ctx, req, username, password)
-	if len(loginPolicies) == 0 {
+	if err != nil || (resp != nil && resp.IsError()) {
 		return resp, err
 	}
+
 	finalPolicies := cfg.TokenPolicies
 	if len(loginPolicies) > 0 {
 		finalPolicies = append(finalPolicies, loginPolicies...)
